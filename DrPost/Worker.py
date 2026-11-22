@@ -1,97 +1,81 @@
-from smtplib import SMTP
-import datetime
-from urllib import response
-from logger import logger, log_level
+from contextlib import contextmanager
 from email.message import EmailMessage
+from smtplib import SMTP, SMTPRecipientsRefused
+
+from logger import logger, log_level
 
 log = logger()
 
+
 class DrMail:
-    def __init__(self, sender_mail, app_password, host="smtp.gmail.com", port=587):
-        try:
-            log.log(log_level.WARNING, "Worker.py", f"Teaching doctor how to send mail....")
-            self.sender_mail = sender_mail
-            self.app_password = app_password
-            self.host = host
-            self.port = port
+    """Sends mail through an SMTP server (Gmail by default).
 
-            self.smtp = SMTP(host, port)
-            self.smtp.connect(host, port)
+    `session()` opens one SMTP connection for a batch and closes it afterwards,
+    so no connection is left idle (Gmail drops idle ones) and no connection is
+    shared between threads.
 
-            status_code, response = self.smtp.ehlo()
-            log.log(log_level.INFO, "Worker.py", f"status_code: {status_code} | response: {response}")
+    In dry-run mode nothing is sent. Addresses ending in "@fail.test" fail on
+    purpose, so retries and partial failures can be shown in a demo.
+    """
 
-            status_code, response = self.smtp.starttls()
-            log.log(log_level.INFO, "Worker.py", f"status_code: {status_code} | response: {response}")
+    def __init__(self, sender_mail, app_password, host="smtp.gmail.com", port=587,
+                 sender_name="Dr. Post", dry_run=False):
+        self.sender_mail = sender_mail
+        self.app_password = app_password
+        self.host = host
+        self.port = port
+        self.sender_name = sender_name
+        self.dry_run = dry_run
 
-            self.smtp.login(sender_mail, app_password)
-            log.log(log_level.INFO, "Worker.py", f"SMTP Login Done...")
+        if dry_run:
+            log.log(log_level.WARNING, "Worker.py", "DRY RUN mode: mail is logged, not sent.")
+        elif not sender_mail or not app_password:
+            raise ValueError("SENDER_EMAIL and SENDER_APP_PASSWORD must be set (see .env.example).")
 
-            status_code, response = self.smtp.ehlo()
-            log.log(log_level.INFO, "Worker.py", f"status_code: {status_code} | response: {response}")
-        except Exception as err:
-            log.log(log_level.CRITICAL, "Worker.py", f"__init__ function: {err}")
-            raise Exception(err)
+    def build(self, to_addr, sub, body, html=False, reply_to=None, attachments=()):
+        msg = EmailMessage()
+        # Gmail rewrites any other "From" to the logged-in account anyway, and
+        # letting callers choose it invites spoofing.
+        msg["From"] = f"{self.sender_name} <{self.sender_mail or 'dry-run@localhost'}>"
+        msg["To"] = to_addr
+        msg["Subject"] = sub
+        if reply_to:
+            msg["Reply-To"] = reply_to
+        if html:
+            msg.set_content("This message contains HTML. Please view it in an HTML-capable mail client.")
+            msg.add_alternative(body, subtype="html")
+        else:
+            msg.set_content(body)
+        for att in attachments:
+            maintype, _, subtype = (att["content_type"] or "application/octet-stream").partition("/")
+            msg.add_attachment(att["data"], maintype=maintype, subtype=subtype or "octet-stream",
+                               filename=att["filename"])
+        return msg
+
+    @contextmanager
+    def session(self):
+        """Yields a send(msg) function backed by one SMTP connection."""
+        if self.dry_run:
+            def fake_send(msg):
+                if str(msg["To"]).lower().endswith("@fail.test"):
+                    raise SMTPRecipientsRefused({msg["To"]: (550, b"dry-run test failure")})
+                log.log(log_level.INFO, "Worker.py", f"[dry run] '{msg['Subject']}' -> {msg['To']}")
+            yield fake_send
             return
 
-    def SendMail(self, from_addr, to_addr, sub, msg_content):
+        smtp = SMTP(self.host, self.port, timeout=30)  # the constructor already connects
         try:
-            log.log(log_level.WARNING, "Worker.py", f"Doctor is trying his best to send the message...")
-            msg = EmailMessage()
-            msg["From"] = from_addr
-            msg["To"] = to_addr
-            msg["Subject"] = sub
-            msg.set_content(msg_content)
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(self.sender_mail, self.app_password)
 
-            self.smtp.send_message(msg)
-            log.log(log_level.INFO, "Worker.py", f"Message Sent...")
-        except Exception as err:
-            log.log(log_level.ERROR, "Worker.py", f"SendMail function: {err}")
-            raise Exception(err)
-            return
-
-    def SendMultipleMail(self, from_addr, *to_addr, sub, msg_content):
-        try:
-            log.log(log_level.WARNING, "Worker.py", f"Doctor is trying his best to send the message...")
-
-            for addr in to_addr:
-                print("atleast doing stuff")
-                msg = EmailMessage()
-                msg["From"] = from_addr
-                msg["To"] = addr
-                msg["Subject"] = sub
-                msg.set_content(msg_content)
-                self.smtp.send_message(msg)
-                log.log(log_level.INFO, "Worker.py", f"Message Sent... to {addr}")
-        except Exception as err:
-            log.log(log_level.ERROR, "Worker.py", f"SendMail function: {err}")
-            raise Exception(err)
-            return
-
-    def SendMultipleMailAPI(self, from_addr, to_addr, sub, msg_content):
-        try:
-            for address in to_addr:
-                email = EmailMessage()
-                email["From"] = from_addr
-                email["To"] = address
-                email["Subject"] = sub
-                email.set_content(msg_content)
-
-                self.smtp.send_message(email)
-                log.log(log_level.INFO, "Worker.py", f"Message Sent... to {address}")
-
-            return True
-
-        except Exception as err:
-            log.log(
-                log_level.ERROR,
-                "Worker.py",
-                f"SendMultipleMail function: {err}"
-            )
-            raise Exception(err)
-
-    def __exit__(self, exc_type, exc, tb):
-        self.smtp.quit()
-        log.log(log_level.CRITICAL, "Worker.py", f"Destroying Doctor.... *bang* *bang*")
-        return
-        
+            def send(msg):
+                smtp.send_message(msg)
+                log.log(log_level.INFO, "Worker.py", f"Sent '{msg['Subject']}' -> {msg['To']}")
+            yield send
+        finally:
+            try:
+                smtp.quit()
+            except Exception:
+                pass

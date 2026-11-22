@@ -399,3 +399,9 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Secrets
+.env
+
+# Local database and uploaded attachments
+DrPost/data/
